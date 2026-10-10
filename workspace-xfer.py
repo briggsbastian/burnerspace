@@ -12,6 +12,8 @@ import secrets
 import socket
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 
 ROOT = os.path.join(
@@ -21,6 +23,8 @@ ROOT = os.path.join(
 GUEST_ROOT = "/workspace"
 GUEST_BIN = "/run/current-system/sw/bin/"
 CHUNK = 2 * 1024 * 1024
+# Longest reply line accepted from the guest; a file chunk is CHUNK in base64.
+REPLY_LIMIT = 8 * 1024 * 1024
 
 
 class Error(Exception):
@@ -41,18 +45,20 @@ class GuestAgent:
         # until the one matching our id shows up.
         ident = secrets.randbelow(2**31)
         self._send("guest-sync", {"id": ident})
+        deadline = time.monotonic() + 10
         try:
-            while True:
-                line = self.file.readline()
+            while time.monotonic() < deadline:
+                line = self.file.readline(REPLY_LIMIT)
                 if not line:
                     raise Error("guest agent closed the connection")
                 try:
                     if json.loads(line).get("return") == ident:
                         return
-                except ValueError:
+                except (ValueError, AttributeError):
                     pass
         except socket.timeout:
-            raise Error("guest agent is not responding (is the VM still booting?)")
+            pass
+        raise Error("guest agent is not responding (is the VM still booting?)")
 
     def _send(self, execute, arguments):
         self.file.write(json.dumps({"execute": execute, "arguments": arguments}).encode() + b"\n")
@@ -60,10 +66,17 @@ class GuestAgent:
 
     def call(self, execute, **arguments):
         self._send(execute, arguments)
-        reply = json.loads(self.file.readline())
-        if "error" in reply:
-            raise Error(f"{execute}: {reply['error'].get('desc', reply['error'])}")
-        return reply["return"]
+        # The guest writes these replies, so trust neither size nor shape.
+        line = self.file.readline(REPLY_LIMIT)
+        if not line.endswith(b"\n"):
+            raise Error(f"{execute}: oversized or truncated reply from the guest")
+        try:
+            reply = json.loads(line)
+            if "error" in reply:
+                raise Error(f"{execute}: {reply['error'].get('desc', reply['error'])}")
+            return reply["return"]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise Error(f"{execute}: malformed reply from the guest")
 
     def run(self, *argv):
         """Run a command in the guest as root and return its stdout."""
@@ -179,14 +192,23 @@ def do_export(agent, args):
             "--exclude=./lost+found", "--exclude=./.export-*.tar", "--exclude=./.import-*.tar",
             *paths,
         )
-        tar = subprocess.Popen(["tar", "-xf", "-", "-C", dest, "--no-same-owner"], stdin=subprocess.PIPE)
-        try:
-            agent.read_file(staged, tar.stdin)
-            tar.stdin.close()
-            if tar.wait() != 0:
-                raise Error("tar failed on the host")
-        finally:
-            tar.kill()
+        # The archive is whatever the guest says it is. Spool it to the host,
+        # then let tarfile's "data" filter refuse members that would land
+        # outside dest (absolute names, "..", escaping links) or are devices.
+        with tempfile.TemporaryFile(dir=dest) as spool:
+            agent.read_file(staged, spool)
+            spool.seek(0)
+            try:
+                with tarfile.open(fileobj=spool) as tar:
+                    for member in tar:
+                        tarfile.data_filter(member, dest)
+                        target = os.path.join(dest, member.name)
+                        merges = member.isdir() and os.path.isdir(target) and not os.path.islink(target)
+                        if os.path.lexists(target) and not merges and not args.overwrite:
+                            raise Error(f"{target} already exists; pass --overwrite to replace it")
+                    tar.extractall(dest, filter="data")
+            except (tarfile.TarError, OSError) as e:
+                raise Error(f"refusing the archive from the guest: {e}")
     finally:
         agent.run("rm", "-f", staged)
 
@@ -203,6 +225,8 @@ def main():
         p = sub.add_parser(name)
         p.add_argument("-w", "--workspace", help="workspace name, needed when several are running")
         p.add_argument("-d", "--dest", help=dest_help)
+        if name == "export":
+            p.add_argument("--overwrite", action="store_true", help="replace existing host files")
         p.add_argument("paths", nargs="+" if name == "import" else "*", help=paths_help)
         p.set_defaults(func=func)
     args = parser.parse_args()

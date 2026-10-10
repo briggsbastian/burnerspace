@@ -21,6 +21,7 @@
     extraGroups = [ "wheel" "video" ];
   };
   security.sudo.wheelNeedsPassword = false;
+  systemd.tmpfiles.settings."10-workspace"."/workspace".d.user = "user";
 
   environment.systemPackages = with pkgs; [ firefox ];
 }

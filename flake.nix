@@ -8,6 +8,7 @@
   outputs = { self, nixpkgs, microvm }:
     let
       system = "x86_64-linux";
+      pkgs = nixpkgs.legacyPackages.${system};
 
       mkWorkspace = { name, modules ? [ ], mem ? 3072, vcpu ? 2 }:
         (nixpkgs.lib.nixosSystem {
@@ -39,16 +40,46 @@
         };
       };
 
-      mkApp = runner: {
+      # Run each VM from a private instance directory that holds its
+      # workspace image and control socket, and remove it on exit.
+      mkLauncher = name: runner:
+        pkgs.writeShellApplication {
+          name = "workspace-${name}";
+          text = ''
+            root="''${XDG_CACHE_HOME:-$HOME/.cache}/disposable-vm"
+            mkdir -p "$root"
+            dir=$(mktemp -d "$root/${name}-XXXXXX")
+            trap 'rm -rf "$dir"' EXIT
+            cd "$dir"
+            echo "workspace: $(basename "$dir")" >&2
+            ${runner}/bin/microvm-run "$@"
+          '';
+        };
+
+      launchers = nixpkgs.lib.mapAttrs mkLauncher profiles;
+
+      # `import` / `export`: copy files to and from a running workspace.
+      mkXfer = command:
+        pkgs.writeShellApplication {
+          name = "workspace-${command}";
+          runtimeInputs = [ pkgs.python3 pkgs.gnutar ];
+          text = ''
+            exec python3 ${./workspace-xfer.py} ${command} "$@"
+          '';
+        };
+
+      commands = nixpkgs.lib.genAttrs [ "import" "export" ] mkXfer;
+
+      mkApp = launcher: {
         type = "app";
-        program = "${runner}/bin/microvm-run";
+        program = nixpkgs.lib.getExe launcher;
       };
     in
     {
-      packages.${system} = profiles // { default = profiles.base; };
+      packages.${system} = launchers // commands // { default = launchers.base; };
 
-      apps.${system} = (nixpkgs.lib.mapAttrs (_: mkApp) profiles) // {
-        default = mkApp profiles.base;
+      apps.${system} = (nixpkgs.lib.mapAttrs (_: mkApp) (launchers // commands)) // {
+        default = mkApp launchers.base;
       };
     };
 }
